@@ -1,4 +1,4 @@
-A websocket based arbitrary shell code executor with long-keeping and reusable input and output.
+A websocket based arbitrary shell command executor with long-keeping and reusable input and output.
 ## Run
 ```shell
 ./websocket-shell 0.0.0.0:8080

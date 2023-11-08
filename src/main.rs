@@ -17,7 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use utf8_read::{Char, Reader};
 type OutputReceiver = Arc<AsyncMutex<futures_channel::mpsc::Receiver<String>>>;
-fn kill_childs(process_id: u32) {
+fn kill_children(process_id: u32) {
     let find_child_command = Command::new(format!("pgrep"))
         .arg("-P")
         .arg(process_id.to_string())
@@ -62,8 +62,8 @@ async fn handle_connection(
         if !command_txt.ends_with("\n") {
             command_txt.push('\n');
         }
-        if command_txt.trim().ends_with("ctrl+c") {
-            kill_childs(CHILD_PROCESS_ID.load(Ordering::Acquire));
+        if command_txt.trim().starts_with("ctrl+c") {
+            kill_children(CHILD_PROCESS_ID.load(Ordering::Acquire));
             return future::ok(());
         }
         command_input
@@ -73,10 +73,21 @@ async fn handle_connection(
             .unwrap();
         future::ok(())
     });
+
     let send_output = async move {
+        let receiver = receiver.try_lock();
+        if let None = receiver {
+            outgoing
+                .send(Message::Text(String::from(
+                    "Another client has already connected",
+                )))
+                .await
+                .unwrap();
+            return;
+        }
+        let mut next = receiver.unwrap();
+        let mut next_err = error_receiver.lock().await;
         loop {
-            let mut next = receiver.lock().await;
-            let mut next_err = error_receiver.lock().await;
             let string_out = next.next();
             let string_out_err = next_err.next();
             let receive_string_result = future::select(string_out, string_out_err).await;
@@ -154,13 +165,15 @@ async fn main() -> Result<(), IoError> {
 
     CHILD_PROCESS_ID.store(out.id(), std::sync::atomic::Ordering::Relaxed);
 
-    command_in.write_all("echo 'Shell started'\n".as_bytes()).unwrap();
+    command_in
+        .write_all("echo 'Shell started'\n".as_bytes())
+        .unwrap();
     let command_in = Arc::new(Mutex::new(command_in));
     let output_err = out.stderr.take().unwrap();
     let mut output = out.stdout.take().unwrap();
     let mut buf = [0; 32];
     output.read(&mut buf).unwrap();
-    print!("{}",String::from_utf8(buf.to_vec()).unwrap());
+    print!("{}", String::from_utf8(buf.to_vec()).unwrap());
 
     let (tx_char, rx_char) = std::sync::mpsc::channel();
     let (tx_err_char, rx_err_char) = std::sync::mpsc::channel();
