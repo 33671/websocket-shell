@@ -1,13 +1,13 @@
 use futures::{executor::block_on, lock::Mutex as AsyncMutex, SinkExt};
-use futures_channel::mpsc::channel;
-use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
+use futures_channel::mpsc::unbounded;
+use futures_util::{future, pin_mut, StreamExt};
 use std::{
     env,
     io::{Error as IoError, Read, Write},
     net::SocketAddr,
     process::{ChildStdin, Command, Stdio},
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicI32, AtomicU32, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -16,7 +16,7 @@ use std::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use utf8_read::{Char, Reader};
-type OutputReceiver = Arc<AsyncMutex<futures_channel::mpsc::Receiver<String>>>;
+type OutputReceiver = Arc<AsyncMutex<futures_channel::mpsc::UnboundedReceiver<String>>>;
 fn kill_children(process_id: u32) {
     let find_child_command = Command::new(format!("pgrep"))
         .arg("-P")
@@ -47,50 +47,57 @@ async fn handle_connection(
         .await
         .expect("Error during the websocket handshake occurred");
     println!("Connection established: {}", addr);
+    let (mut outgoing, mut incoming) = ws_stream.split();
+    let receiver_lock = receiver.try_lock();
+    if receiver_lock.is_none() {
+        let _ = outgoing
+            .send(Message::Text("Another client has already connected".into()))
+            .await;
+        return;
+    }
+    let mut next_err = error_receiver.lock().await;
+    let run_command = async move {
+        loop {
+            let msg_res = incoming.next().await;
+            if msg_res.is_none() {
+                continue;
+            }
+            let msg_res = msg_res.unwrap();
+            if msg_res.is_err() {
+                return;
+            }
+            let msg = msg_res.unwrap();
+            println!(
+                "Received a command from {}: {}",
+                addr,
+                msg.to_text().unwrap()
+            );
+            if !msg.is_text() {
+                return;
+            }
+            let mut command_txt = msg.to_string();
+            if !command_txt.ends_with("\n") {
+                command_txt.push('\n');
+            }
+            if command_txt.trim().starts_with("ctrl+c") {
+                kill_children(CHILD_PROCESS_ID.load(Ordering::Acquire));
+            } else {
+                command_input
+                    .lock()
+                    .unwrap()
+                    .write_all(command_txt.as_bytes())
+                    .unwrap();
+            }
+        }
+    };
 
-    let (mut outgoing, incoming) = ws_stream.split();
-    let run_command = incoming.try_for_each_concurrent(2, |msg| {
-        println!(
-            "Received a command from {}: {}",
-            addr,
-            msg.to_text().unwrap()
-        );
-        if !msg.is_text() {
-            return future::ok(());
-        }
-        let mut command_txt = msg.to_string();
-        if !command_txt.ends_with("\n") {
-            command_txt.push('\n');
-        }
-        if command_txt.trim().starts_with("ctrl+c") {
-            kill_children(CHILD_PROCESS_ID.load(Ordering::Acquire));
-            return future::ok(());
-        }
-        command_input
-            .lock()
-            .unwrap()
-            .write_all(command_txt.as_bytes())
-            .unwrap();
-        future::ok(())
-    });
-
+    let mut next = receiver_lock.unwrap();
     let send_output = async move {
-        let receiver = receiver.try_lock();
-        if let None = receiver {
-            outgoing
-                .send(Message::Text(String::from(
-                    "Another client has already connected",
-                )))
-                .await
-                .unwrap();
-            return;
-        }
-        let mut next = receiver.unwrap();
-        let mut next_err = error_receiver.lock().await;
         loop {
             let string_out = next.next();
             let string_out_err = next_err.next();
             let receive_string_result = future::select(string_out, string_out_err).await;
+            BUFFER_COUNTER.fetch_sub(1, Ordering::Relaxed);
             let result_string: Option<String>;
             match receive_string_result {
                 future::Either::Left((value1, _)) => {
@@ -101,32 +108,31 @@ async fn handle_connection(
                 }
             }
             if let Some(output_buff) = result_string {
-                outgoing.send(Message::Text(output_buff)).await.unwrap();
+                if outgoing.send(Message::Text(output_buff)).await.is_err() {
+                    return;
+                }
             }
         }
     };
-    pin_mut!(send_output);
+    pin_mut!(run_command, send_output);
     future::select(run_command, send_output).await;
     println!("{} disconnected", &addr);
+
+    // kill_children(CHILD_PROCESS_ID.load(Ordering::Acquire));
 }
 const BUFFER_SIZE: usize = 128;
+static BUFFER_COUNTER: AtomicI32 = AtomicI32::new(0);
 static CHILD_PROCESS_ID: AtomicU32 = AtomicU32::new(0);
 fn read_buffer(
     rx_char: std::sync::mpsc::Receiver<Result<Char, utf8_read::Error>>,
-    tx_out_put: &mut futures_channel::mpsc::Sender<String>,
+    tx_out_put: &mut futures_channel::mpsc::UnboundedSender<String>,
 ) {
     let mut send_buffer: Vec<char> = Vec::with_capacity(BUFFER_SIZE);
     loop {
+        let mut send = false;
         let received = rx_char.recv_timeout(Duration::from_millis(100));
-        if received.is_err() {
-            let result = String::from_iter(&send_buffer);
-            send_buffer.clear();
-            if !result.is_empty() {
-                // print!("{result}");
-                block_on(tx_out_put.send(result)).unwrap();
-            }
-        } else {
-            let char_res = received.unwrap().expect("read char error");
+        if received.is_ok() {
+            let char_res = received.unwrap().unwrap_or(Char::Char('?'));
             match char_res {
                 Char::NoData => {
                     panic!("program exit");
@@ -136,15 +142,24 @@ fn read_buffer(
                 }
                 Char::Char(origin_char) => {
                     if send_buffer.len() >= BUFFER_SIZE {
-                        let result = String::from_iter(&send_buffer);
-                        send_buffer.clear();
-                        if !result.is_empty() {
-                            // print!("{result}");
-                            block_on(tx_out_put.send(result)).unwrap();
-                        }
+                        send = true;
                     }
                     send_buffer.push(origin_char);
                 }
+            }
+        } else {
+            send = true;
+        }
+        if send {
+            let result = String::from_iter(&send_buffer);
+            send_buffer.clear();
+            if !result.is_empty() {
+                if BUFFER_COUNTER.load(Ordering::Acquire) > 200 {
+                    continue;
+                }
+                block_on(tx_out_put.send(result)).unwrap();
+                BUFFER_COUNTER.fetch_add(1, Ordering::Relaxed);
+                println!("{:?}", BUFFER_COUNTER);
             }
         }
     }
@@ -177,8 +192,8 @@ async fn main() -> Result<(), IoError> {
 
     let (tx_char, rx_char) = std::sync::mpsc::channel();
     let (tx_err_char, rx_err_char) = std::sync::mpsc::channel();
-    let (mut tx_out_put, rx_out_put) = channel(2048);
-    let (mut tx_err_out_put, rx_err_out_put) = channel(2048);
+    let (mut tx_out_put, rx_out_put) = unbounded();
+    let (mut tx_err_out_put, rx_err_out_put) = unbounded();
     let rx_out_put = Arc::new(AsyncMutex::new(rx_out_put));
     let rx_err_out_put = Arc::new(AsyncMutex::new(rx_err_out_put));
 
