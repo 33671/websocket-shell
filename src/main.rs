@@ -159,7 +159,7 @@ fn read_buffer(
                 }
                 block_on(tx_out_put.send(result)).unwrap();
                 BUFFER_COUNTER.fetch_add(1, Ordering::Relaxed);
-                println!("{:?}", BUFFER_COUNTER);
+                // println!("{:?}", BUFFER_COUNTER);
             }
         }
     }
