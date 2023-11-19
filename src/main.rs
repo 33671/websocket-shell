@@ -13,9 +13,10 @@ use std::{
     thread,
     time::Duration,
 };
+
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
-use utf8_read::{Char, Reader};
+use utf8_decode::Decoder;
 type OutputReceiver = Arc<AsyncMutex<futures_channel::mpsc::UnboundedReceiver<String>>>;
 fn kill_children(process_id: u32) {
     let find_child_command = Command::new(format!("pgrep"))
@@ -124,40 +125,33 @@ const BUFFER_SIZE: usize = 128;
 static BUFFER_COUNTER: AtomicI32 = AtomicI32::new(0);
 static CHILD_PROCESS_ID: AtomicU32 = AtomicU32::new(0);
 fn read_buffer(
-    rx_char: std::sync::mpsc::Receiver<Result<Char, utf8_read::Error>>,
+    rx_char: std::sync::mpsc::Receiver<char>,
     tx_out_put: &mut futures_channel::mpsc::UnboundedSender<String>,
 ) {
     let mut send_buffer: Vec<char> = Vec::with_capacity(BUFFER_SIZE);
     loop {
         let mut send = false;
-        let received = rx_char.recv_timeout(Duration::from_millis(100));
+        let received = rx_char.recv_timeout(Duration::from_millis(200));
         if received.is_ok() {
-            let char_res = received.unwrap().unwrap_or(Char::Char('?'));
-            match char_res {
-                Char::NoData => {
-                    panic!("program exit");
-                }
-                Char::Eof => {
-                    panic!("read to End of Line");
-                }
-                Char::Char(origin_char) => {
-                    if send_buffer.len() >= BUFFER_SIZE {
-                        send = true;
-                    }
-                    send_buffer.push(origin_char);
-                }
+            let char_res = received.unwrap();
+            if send_buffer.len() >= BUFFER_SIZE {
+                send = true;
             }
+            send_buffer.push(char_res);
         } else {
             send = true;
         }
         if send {
+            if send_buffer.len() == 0 {
+                continue;
+            }
             let result = String::from_iter(&send_buffer);
             send_buffer.clear();
-            if !result.is_empty() {
-                if BUFFER_COUNTER.load(Ordering::Acquire) > 200 {
-                    continue;
-                }
-                block_on(tx_out_put.send(result)).unwrap();
+            if result.is_empty() || BUFFER_COUNTER.load(Ordering::Acquire) > 200 {
+                continue;
+            }
+            if block_on(tx_out_put.send(result)).is_ok()
+            {
                 BUFFER_COUNTER.fetch_add(1, Ordering::Relaxed);
                 // println!("{:?}", BUFFER_COUNTER);
             }
@@ -198,19 +192,21 @@ async fn main() -> Result<(), IoError> {
     let rx_err_out_put = Arc::new(AsyncMutex::new(rx_err_out_put));
 
     thread::spawn(move || {
-        let mut utf8reader = Reader::new(output);
+        let mut decoder = Decoder::new(output.bytes().map(|x| x.unwrap_or(' ' as u8)));
         loop {
-            //this will block current thread
-            let next = utf8reader.next_char();
-            tx_char.send(next).unwrap();
+            let next = decoder.next();
+            if let Some(next) = next {
+                tx_char.send(next.unwrap_or('?')).unwrap();
+            }
         }
     });
     thread::spawn(move || {
-        let mut utf8reader = Reader::new(output_err);
+        let mut decoder = Decoder::new(output_err.bytes().map(|x| x.unwrap_or(' ' as u8)));
         loop {
-            //this will block current thread
-            let next = utf8reader.next_char();
-            tx_err_char.send(next).unwrap();
+            let next = decoder.next();
+            if let Some(next) = next {
+                tx_err_char.send(next.unwrap_or('?')).unwrap();
+            }
         }
     });
     thread::spawn(move || {
