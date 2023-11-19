@@ -1,7 +1,8 @@
 use futures::{executor::block_on, lock::Mutex as AsyncMutex, SinkExt};
-use futures_channel::mpsc::unbounded;
+use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::{future, pin_mut, StreamExt};
 use std::{
+    collections::HashMap,
     env,
     io::{Error as IoError, Read, Write},
     net::SocketAddr,
@@ -13,7 +14,8 @@ use std::{
     thread,
     time::Duration,
 };
-
+type Tx = UnboundedSender<u32>;
+type PeerMap = Arc<AsyncMutex<HashMap<SocketAddr, Tx>>>;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use utf8_decode::Decoder;
@@ -36,6 +38,7 @@ fn kill_children(process_id: u32) {
         });
 }
 async fn handle_connection(
+    peer_map: PeerMap,
     command_input: Arc<Mutex<ChildStdin>>,
     receiver: OutputReceiver,
     error_receiver: OutputReceiver,
@@ -48,15 +51,19 @@ async fn handle_connection(
         .await
         .expect("Error during the websocket handshake occurred");
     println!("Connection established: {}", addr);
-    let (mut outgoing, mut incoming) = ws_stream.split();
-    let receiver_lock = receiver.try_lock();
-    if receiver_lock.is_none() {
-        let _ = outgoing
-            .send(Message::Text("Another client has already connected".into()))
-            .await;
-        return;
+
+    let (tx, mut rx) = unbounded();
+    {
+        let mut peers = peer_map.lock().await;
+        peers.iter().map(|(_, ws_sink)| ws_sink).for_each(|x| {
+            x.unbounded_send(0).unwrap();
+        });
+        peers.insert(addr, tx);
     }
+    let mut receiver_lock = receiver.lock().await;
     let mut next_err = error_receiver.lock().await;
+
+    let (mut outgoing, mut incoming) = ws_stream.split();
     let run_command = async move {
         loop {
             let msg_res = incoming.next().await;
@@ -68,11 +75,6 @@ async fn handle_connection(
                 return;
             }
             let msg = msg_res.unwrap();
-            println!(
-                "Received a command from {}: {}",
-                addr,
-                msg.to_text().unwrap()
-            );
             if !msg.is_text() {
                 return;
             }
@@ -92,10 +94,9 @@ async fn handle_connection(
         }
     };
 
-    let mut next = receiver_lock.unwrap();
     let send_output = async move {
         loop {
-            let string_out = next.next();
+            let string_out = receiver_lock.next();
             let string_out_err = next_err.next();
             let receive_string_result = future::select(string_out, string_out_err).await;
             BUFFER_COUNTER.fetch_sub(1, Ordering::Relaxed);
@@ -115,11 +116,17 @@ async fn handle_connection(
             }
         }
     };
-    pin_mut!(run_command, send_output);
-    future::select(run_command, send_output).await;
+    let check_connection_occupied = async move {
+        loop {
+            rx.next().await;
+            peer_map.lock().await.remove(&addr);
+            return;
+        }
+    };
+    pin_mut!(run_command, send_output, check_connection_occupied);
+    let selecta = future::select(run_command, send_output);
+    future::select(selecta, check_connection_occupied).await;
     println!("{} disconnected", &addr);
-
-    // kill_children(CHILD_PROCESS_ID.load(Ordering::Acquire));
 }
 const BUFFER_SIZE: usize = 128;
 static BUFFER_COUNTER: AtomicI32 = AtomicI32::new(0);
@@ -150,8 +157,7 @@ fn read_buffer(
             if result.is_empty() || BUFFER_COUNTER.load(Ordering::Acquire) > 200 {
                 continue;
             }
-            if block_on(tx_out_put.send(result)).is_ok()
-            {
+            if block_on(tx_out_put.send(result)).is_ok() {
                 BUFFER_COUNTER.fetch_add(1, Ordering::Relaxed);
                 // println!("{:?}", BUFFER_COUNTER);
             }
@@ -190,6 +196,7 @@ async fn main() -> Result<(), IoError> {
     let (mut tx_err_out_put, rx_err_out_put) = unbounded();
     let rx_out_put = Arc::new(AsyncMutex::new(rx_out_put));
     let rx_err_out_put = Arc::new(AsyncMutex::new(rx_err_out_put));
+    let state = PeerMap::new(AsyncMutex::new(HashMap::new()));
 
     thread::spawn(move || {
         let mut decoder = Decoder::new(output.bytes().map(|x| x.unwrap_or(' ' as u8)));
@@ -221,6 +228,7 @@ async fn main() -> Result<(), IoError> {
 
     while let Ok((stream, addr)) = listener.accept().await {
         tokio::spawn(handle_connection(
+            state.clone(),
             command_in.clone(),
             rx_out_put.clone(),
             rx_err_out_put.clone(),
