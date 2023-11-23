@@ -31,14 +31,15 @@ where
     stream! {
         loop {
             let decoder = decoder.clone();
-            match spawn_blocking(move || decoder.lock().unwrap().next()).await.unwrap() {
-                None => break,
+            match spawn_blocking(move || decoder.lock().unwrap().next()).await.unwrap_or(Some(Ok('?'))) {
+                None => continue,
                 Some(result) => {
                     match result {
-                        Ok(res) => yield res,
+                        Ok(res) =>{print!("{res}"); yield res},
                         Err(_) => {
+                            println!("wrong");
                             yield '?';
-                            break;
+                            continue;
                         }
                     }
                 }
