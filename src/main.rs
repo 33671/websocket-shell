@@ -1,169 +1,14 @@
-use futures::{executor::block_on, lock::Mutex as AsyncMutex, SinkExt};
-use futures_channel::mpsc::{unbounded, UnboundedSender};
-use futures_util::{future, pin_mut, StreamExt};
+use futures::lock::Mutex as AsyncMutex;
+use futures_channel::mpsc::unbounded;
 use std::{
     collections::HashMap,
     env,
     io::{Error as IoError, Read, Write},
-    net::SocketAddr,
-    process::{ChildStdin, Command, Stdio},
-    sync::{
-        atomic::{AtomicI32, AtomicU32, Ordering},
-        Arc, Mutex,
-    },
-    thread,
-    time::Duration,
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
 };
-type Tx = UnboundedSender<u32>;
-type PeerMap = Arc<AsyncMutex<HashMap<SocketAddr, Tx>>>;
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::Message;
-use utf8_decode::Decoder;
-type OutputReceiver = Arc<AsyncMutex<futures_channel::mpsc::UnboundedReceiver<String>>>;
-fn kill_children(process_id: u32) {
-    let find_child_command = Command::new(format!("pgrep"))
-        .arg("-P")
-        .arg(process_id.to_string())
-        .output()
-        .unwrap();
-    String::from_utf8(find_child_command.stdout)
-        .unwrap()
-        .lines()
-        .for_each(|x| {
-            Command::new(format!("kill"))
-                .arg("-INT")
-                .arg(x.trim())
-                .output()
-                .unwrap();
-        });
-}
-async fn handle_connection(
-    peer_map: PeerMap,
-    command_input: Arc<Mutex<ChildStdin>>,
-    receiver: OutputReceiver,
-    error_receiver: OutputReceiver,
-    raw_stream: TcpStream,
-    addr: SocketAddr,
-) {
-    println!("Incoming TCP connection from: {}", addr);
-
-    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
-        .await
-        .expect("Error during the websocket handshake occurred");
-    println!("Connection established: {}", addr);
-
-    let (tx, mut rx) = unbounded();
-    {
-        let mut peers = peer_map.lock().await;
-        peers.iter().map(|(_, ws_sink)| ws_sink).for_each(|x| {
-            x.unbounded_send(0).unwrap();
-        });
-        peers.insert(addr, tx);
-    }
-    let mut receiver_lock = receiver.lock().await;
-    let mut next_err = error_receiver.lock().await;
-
-    let (mut outgoing, mut incoming) = ws_stream.split();
-    let run_command = async move {
-        loop {
-            let msg_res = incoming.next().await;
-            if msg_res.is_none() {
-                continue;
-            }
-            let msg_res = msg_res.unwrap();
-            if msg_res.is_err() {
-                return;
-            }
-            let msg = msg_res.unwrap();
-            if !msg.is_text() {
-                return;
-            }
-            let mut command_txt = msg.to_string();
-            if !command_txt.ends_with("\n") {
-                command_txt.push('\n');
-            }
-            if command_txt.trim().starts_with("ctrl+c") {
-                kill_children(CHILD_PROCESS_ID.load(Ordering::Acquire));
-            } else {
-                command_input
-                    .lock()
-                    .unwrap()
-                    .write_all(command_txt.as_bytes())
-                    .unwrap();
-            }
-        }
-    };
-
-    let send_output = async move {
-        loop {
-            let string_out = receiver_lock.next();
-            let string_out_err = next_err.next();
-            let receive_string_result = future::select(string_out, string_out_err).await;
-            BUFFER_COUNTER.fetch_sub(1, Ordering::Relaxed);
-            let result_string: Option<String>;
-            match receive_string_result {
-                future::Either::Left((value1, _)) => {
-                    result_string = value1;
-                }
-                future::Either::Right((value1, _)) => {
-                    result_string = value1;
-                }
-            }
-            if let Some(output_buff) = result_string {
-                if outgoing.send(Message::Text(output_buff)).await.is_err() {
-                    return;
-                }
-            }
-        }
-    };
-    let check_connection_occupied = async move {
-        loop {
-            rx.next().await;
-            peer_map.lock().await.remove(&addr);
-            return;
-        }
-    };
-    pin_mut!(run_command, send_output, check_connection_occupied);
-    let selecta = future::select(run_command, send_output);
-    future::select(selecta, check_connection_occupied).await;
-    println!("{} disconnected", &addr);
-}
-const BUFFER_SIZE: usize = 128;
-static BUFFER_COUNTER: AtomicI32 = AtomicI32::new(0);
-static CHILD_PROCESS_ID: AtomicU32 = AtomicU32::new(0);
-fn read_buffer(
-    rx_char: std::sync::mpsc::Receiver<char>,
-    tx_out_put: &mut futures_channel::mpsc::UnboundedSender<String>,
-) {
-    let mut send_buffer: Vec<char> = Vec::with_capacity(BUFFER_SIZE);
-    loop {
-        let mut send = false;
-        let received = rx_char.recv_timeout(Duration::from_millis(200));
-        if received.is_ok() {
-            let char_res = received.unwrap();
-            if send_buffer.len() >= BUFFER_SIZE {
-                send = true;
-            }
-            send_buffer.push(char_res);
-        } else {
-            send = true;
-        }
-        if send {
-            if send_buffer.len() == 0 {
-                continue;
-            }
-            let result = String::from_iter(&send_buffer);
-            send_buffer.clear();
-            if result.is_empty() || BUFFER_COUNTER.load(Ordering::Acquire) > 200 {
-                continue;
-            }
-            if block_on(tx_out_put.send(result)).is_ok() {
-                BUFFER_COUNTER.fetch_add(1, Ordering::Relaxed);
-                // println!("{:?}", BUFFER_COUNTER);
-            }
-        }
-    }
-}
+use tokio::net::TcpListener;
+use websocket_shell::{async_stdio, handle_connection, read_buffer, PeerMap, CHILD_PROCESS_ID};
 #[tokio::main]
 async fn main() -> Result<(), IoError> {
     let addr = env::args()
@@ -190,37 +35,20 @@ async fn main() -> Result<(), IoError> {
     output.read(&mut buf).unwrap();
     print!("{}", String::from_utf8(buf.to_vec()).unwrap());
 
-    let (tx_char, rx_char) = std::sync::mpsc::channel();
-    let (tx_err_char, rx_err_char) = std::sync::mpsc::channel();
+
     let (mut tx_out_put, rx_out_put) = unbounded();
     let (mut tx_err_out_put, rx_err_out_put) = unbounded();
     let rx_out_put = Arc::new(AsyncMutex::new(rx_out_put));
     let rx_err_out_put = Arc::new(AsyncMutex::new(rx_err_out_put));
     let state = PeerMap::new(AsyncMutex::new(HashMap::new()));
 
-    thread::spawn(move || {
-        let mut decoder = Decoder::new(output.bytes().map(|x| x.unwrap_or(' ' as u8)));
-        loop {
-            let next = decoder.next();
-            if let Some(next) = next {
-                tx_char.send(next.unwrap_or('?')).unwrap();
-            }
-        }
+    tokio::spawn(async move {
+        let decoder = async_stdio(output);
+        read_buffer(decoder, &mut tx_out_put).await;
     });
-    thread::spawn(move || {
-        let mut decoder = Decoder::new(output_err.bytes().map(|x| x.unwrap_or(' ' as u8)));
-        loop {
-            let next = decoder.next();
-            if let Some(next) = next {
-                tx_err_char.send(next.unwrap_or('?')).unwrap();
-            }
-        }
-    });
-    thread::spawn(move || {
-        read_buffer(rx_char, &mut tx_out_put);
-    });
-    thread::spawn(move || {
-        read_buffer(rx_err_char, &mut tx_err_out_put);
+    tokio::spawn(async move {
+        let decoder = async_stdio(output_err);
+        read_buffer(decoder, &mut tx_err_out_put).await;
     });
 
     let listener = TcpListener::bind(&addr).await?;
