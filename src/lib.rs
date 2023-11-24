@@ -1,12 +1,12 @@
 use async_stream::stream;
 use futures::{lock::Mutex as AsyncMutex, SinkExt};
 use futures_channel::mpsc::{unbounded, UnboundedSender};
-use futures_util::{future, pin_mut, Stream, StreamExt};
+use futures_util::{future, pin_mut, StreamExt};
 use std::{
     collections::HashMap,
     io::{Read, Write},
     net::SocketAddr,
-    process::{ChildStdin, Command},
+    process::{self, ChildStdin, Command},
     sync::{
         atomic::{AtomicI32, AtomicU32, Ordering},
         Arc, Mutex,
@@ -19,10 +19,10 @@ use utf8_decode::Decoder;
 type Tx = UnboundedSender<u32>;
 type OutputReceiver = Arc<AsyncMutex<futures_channel::mpsc::UnboundedReceiver<String>>>;
 pub type PeerMap = Arc<AsyncMutex<HashMap<SocketAddr, Tx>>>;
-pub const BUFFER_SIZE: usize = 128;
-pub static BUFFER_COUNTER: AtomicI32 = AtomicI32::new(0);
+const BUFFER_SIZE: usize = 128;
+static BUFFER_COUNTER: AtomicI32 = AtomicI32::new(0);
 pub static CHILD_PROCESS_ID: AtomicU32 = AtomicU32::new(0);
-pub fn async_stdio<R>(reader: R) -> impl futures::Stream<Item = char>
+fn async_stdio<R>(reader: R) -> impl futures::Stream<Item = char>
 where
     R: Read + Send + 'static,
 {
@@ -31,16 +31,12 @@ where
     stream! {
         loop {
             let decoder = decoder.clone();
-            match spawn_blocking(move || decoder.lock().unwrap().next()).await.unwrap_or(Some(Ok('?'))) {
-                None => continue,
+            match spawn_blocking(move || decoder.lock().unwrap().next()).await.unwrap_or_else(|_| process::exit(0x0000)) {
+                None => process::exit(0x0000),
                 Some(result) => {
                     match result {
-                        Ok(res) =>{print!("{res}"); yield res},
-                        Err(_) => {
-                            println!("wrong");
-                            yield '?';
-                            continue;
-                        }
+                        Ok(res) => yield res,
+                        Err(_) => yield '?'
                     }
                 }
             }
@@ -100,7 +96,7 @@ pub async fn handle_connection(
                     .lock()
                     .unwrap()
                     .write_all(command_txt.as_bytes())
-                    .unwrap();
+                    .unwrap_or_else(|_| process::exit(0x0000));
             }
         }
     };
@@ -128,15 +124,18 @@ pub async fn handle_connection(
     println!("{} disconnected", &addr);
 }
 
-pub async fn read_buffer(
-    rx_char: impl Stream<Item = char>,
-    tx_out_put: &mut futures_channel::mpsc::UnboundedSender<String>,
-) {
+pub async fn read_buffer<R>(
+    rx_char: R,
+    mut tx_out_put: futures_channel::mpsc::UnboundedSender<String>,
+) where
+    R: Read + Send + 'static,
+{
+    let decoder = async_stdio(rx_char);
+    pin_mut!(decoder);
     let mut send_buffer: Vec<char> = Vec::with_capacity(BUFFER_SIZE);
-    pin_mut!(rx_char);
     loop {
         let mut send = false;
-        let received = match time::timeout(Duration::from_millis(200), rx_char.next()).await {
+        let received = match time::timeout(Duration::from_millis(200), decoder.next()).await {
             Ok(next) => next,
             Err(_) => {
                 send = true;
@@ -151,7 +150,7 @@ pub async fn read_buffer(
             }
         }
         if send {
-            if send_buffer.len() == 0 {
+            if send_buffer.is_empty() {
                 continue;
             }
             let result = String::from_iter(&send_buffer);
